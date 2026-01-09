@@ -7,6 +7,12 @@ public class PlayerMovement2D : MonoBehaviour
     [Header("Movement")]
     public float moveSpeed = 5f;
     public float jumpForce = 10f;
+    [Header("Advanced Movement (Hollow Knight Style)")]
+    public float acceleration = 60f;          // accélération au sol
+    public float deceleration = 50f;          // décélération au sol
+    public float airAcceleration = 30f;       // accélération en l'air
+    public float airDeceleration = 25f;       // décélération en l'air
+    public float airControlMultiplier = 0.6f; // contrôle réduit en l'air
 
     [Header("Dash")]
     public float dashSpeed = 20f;
@@ -21,83 +27,112 @@ public class PlayerMovement2D : MonoBehaviour
     public float wallJumpForce = 15f;
     public float wallJumpControlDelay = 0.2f;
 
-    [Header("Wall Slide")] 
+    [Header("Wall Slide")]
     public float wallSlideSpeed = 2f;
 
-    [Header("Ground Check (optionnel)")]
+    [Header("Ground Check")]
     public Transform groundCheck;
     public float groundCheckRadius = 0.2f;
     public LayerMask groundLayer;
 
-    [Header("Wall Check (optionnel)")]
-    public Transform wallCheck;
+    [Header("Wall Check")]
+    public Transform wallCheckLeft;
+    public Transform wallCheckRight;
     public float wallCheckDistance = 0.2f;
     public LayerMask wallLayer;
 
     [Header("Coyote Time")]
     public float coyoteTime = 0.1f;
-    private float coyoteCounter;
+    public float coyoteCounter;
+
+   [Header("Variable Jump")]
+    public float jumpCutMultiplier = 0.5f;        // coupe le saut si relâché tôt
+    public float fallGravityMultiplier = 2f;      // accélère la chute
+    public float lowJumpGravityMultiplier = 2.5f; // chute plus rapide si saut court
 
     [Header("Jump Buffer")]
     public float jumpBufferTime = 0.1f;
-    private float jumpBufferCounter;
+    public float jumpBufferCounter;
 
-    private Rigidbody2D rb;
-    private Vector2 moveInput;
+    [Header ("Skills")]
+    public Rigidbody2D rb;
+    public Vector2 moveInput;
+    public bool isGrounded;
+    public bool isTouchingWall;
+    public bool isDashing;
+    public bool isWallJumping;
+    public bool blockTowardsWall;
+    public bool canDash = true;
+    public Vector2 wallNormal;
 
-    private bool isGrounded;
-    private bool isTouchingWall;
-    private bool isDashing;
-    private bool isWallJumping;
-    private bool blockTowardsWall;
-    private bool canDash = true;
+    [Header("Landing Smoothing")]
+    public float landingSmoothingTime = 0.08f; // durée de l’amorti
+    public float landingMaxFallSpeed = -12f;   // vitesse max considérée comme "forte chute"
+    private bool isLandingSmoothing = false;
 
-    private Vector2 wallNormal;
+    [Header("Landing Freeze Frame")]
+    public float landingFreezeDuration = 0.03f;
+    public ParticleSystem landingDust;
 
-    // Fallbacks si les checks avancés ne sont pas configurés
-    private bool useCollisionGround = true;
-    private bool useCollisionWall = true;
 
     void Start()
     {
         rb = GetComponent<Rigidbody2D>();
-
         if (dashTrail != null)
             dashTrail.emitting = false;
-
-        if (groundCheck != null)
-            useCollisionGround = false;
-
-        if (wallCheck != null)
-            useCollisionWall = false;
     }
 
     void Update()
-    {
-        // Ground check avancé si configuré
-        if (groundCheck != null)
+    {   
+        // Détection d'atterrissage
+        bool wasGrounded = isGrounded;
+        isGrounded = Physics2D.OverlapCircle(groundCheck.position, groundCheckRadius, groundLayer);
+
+        if (!wasGrounded && isGrounded)
         {
-            isGrounded = Physics2D.OverlapCircle(groundCheck.position, groundCheckRadius, groundLayer);
+            float fallSpeed = rb.velocity.y;
+
+            // Debug pour vérifier
+            Debug.Log("Landing detected with fall speed: " + fallSpeed);
+
+            // Seulement si la chute est assez grande
+            if (fallSpeed < landingMaxFallSpeed)
+            {
+                if (landingDust != null)
+                {
+                    landingDust.transform.position = groundCheck.position;
+                    landingDust.Play();
+                }
+
+                StartCoroutine(LandingFreezeFrame());
+                StartCoroutine(LandingSmoothing());
+            }
         }
 
-        // Wall check avancé si configuré
-        if (wallCheck != null)
+        // --- Ground Check ---
+        isGrounded = Physics2D.OverlapCircle(groundCheck.position, groundCheckRadius, groundLayer);
+
+        // --- Wall Check (gauche + droite) ---
+        bool leftWall = Physics2D.Raycast(wallCheckLeft.position, Vector2.left, wallCheckDistance, wallLayer);
+        bool rightWall = Physics2D.Raycast(wallCheckRight.position, Vector2.right, wallCheckDistance, wallLayer);
+
+        if (leftWall)
         {
-            Vector2 dir = Vector2.right * Mathf.Sign(transform.localScale.x);
-            RaycastHit2D hit = Physics2D.Raycast(wallCheck.position, dir, wallCheckDistance, wallLayer);
-            if (hit.collider != null)
-            {
-                isTouchingWall = true;
-                wallNormal = hit.normal;
-            }
-            else
-            {
-                isTouchingWall = false;
-                wallNormal = Vector2.zero;
-            }
+            isTouchingWall = true;
+            wallNormal = Vector2.right; // mur à gauche → normale vers la droite
+        }
+        else if (rightWall)
+        {
+            isTouchingWall = true;
+            wallNormal = Vector2.left; // mur à droite → normale vers la gauche
+        }
+        else
+        {
+            isTouchingWall = false;
+            wallNormal = Vector2.zero;
         }
 
-        // Coyote time
+        // --- Coyote Time ---
         if (isGrounded)
             coyoteCounter = coyoteTime;
         else
@@ -106,26 +141,86 @@ public class PlayerMovement2D : MonoBehaviour
         // Jump buffer
         jumpBufferCounter -= Time.deltaTime;
 
-        // Jump déclenché si buffer + coyote
-        if (jumpBufferCounter > 0f && coyoteCounter > 0f)
+        // Empêche le buffer de dépasser la valeur max
+        if (jumpBufferCounter > jumpBufferTime)
+            jumpBufferCounter = jumpBufferTime;
+
+        // Empêche le buffer de rester actif dans des états où il ne doit pas servir
+        if (isTouchingWall || isDashing || isWallJumping)
+            jumpBufferCounter = Mathf.Min(jumpBufferCounter, 0.02f); // expire quasi immédiatement
+
+        // Clamp final
+        jumpBufferCounter = Mathf.Clamp(jumpBufferCounter, 0f, jumpBufferTime);
+
+        // Saut normal (pas sur un mur)
+        if (jumpBufferCounter > 0f && coyoteCounter > 0f && !isTouchingWall)
         {
             rb.velocity = new Vector2(rb.velocity.x, jumpForce);
             jumpBufferCounter = 0f;
         }
 
-        // Réinitialisation de l'air-dash
+        // --- Reset Air Dash ---
         if (isGrounded || isTouchingWall)
             hasAirDash = true;
 
-        // Wall slide
+        // --- Wall Slide ---
         if (!isGrounded && isTouchingWall && !isDashing && !isWallJumping)
         {
             if (rb.velocity.y < -wallSlideSpeed)
                 rb.velocity = new Vector2(rb.velocity.x, -wallSlideSpeed);
         }
 
+        // Gravité dynamique (façon Hollow Knight / Celeste)
+        if (!isGrounded && !isWallJumping && !isDashing)
+        {
+            // Chute normale → accélérée
+            if (rb.velocity.y < 0)
+            {
+                rb.velocity += Vector2.up * Physics2D.gravity.y * (fallGravityMultiplier - 1) * Time.deltaTime;
+            }
+            // Saut court → chute encore plus rapide
+            else if (rb.velocity.y > 0 && !Keyboard.current.spaceKey.isPressed)
+            {
+                rb.velocity += Vector2.up * Physics2D.gravity.y * (lowJumpGravityMultiplier - 1) * Time.deltaTime;
+            }
+        }
+
+
+
         if (!isDashing)
             MovePlayer();
+    }
+
+    private IEnumerator LandingFreezeFrame()
+    {
+        float originalTimeScale = Time.timeScale;
+        Time.timeScale = 0.05f; // micro-pause
+        yield return new WaitForSecondsRealtime(landingFreezeDuration);
+        Time.timeScale = originalTimeScale;
+    }
+
+
+    private IEnumerator LandingSmoothing()
+    {
+        isLandingSmoothing = true;
+
+        float timer = 0f;
+        float initialYVel = rb.velocity.y;
+
+        while (timer < landingSmoothingTime)
+        {
+            timer += Time.deltaTime;
+
+            // interpolation douce vers 0
+            float t = timer / landingSmoothingTime;
+            float smoothVel = Mathf.Lerp(initialYVel, 0f, t);
+
+            rb.velocity = new Vector2(rb.velocity.x, smoothVel);
+
+            yield return null;
+        }
+
+        isLandingSmoothing = false;
     }
 
     public void OnMove(InputAction.CallbackContext context)
@@ -137,14 +232,21 @@ public class PlayerMovement2D : MonoBehaviour
     {
         if (context.performed)
         {
-            // Intention de saut (jump buffer)
             jumpBufferCounter = jumpBufferTime;
 
-            // Wall jump prioritaire si en l'air et contre un mur
+            // Wall jump prioritaire
             if (!isGrounded && isTouchingWall)
             {
                 WallJump();
                 jumpBufferCounter = 0f;
+            }
+        }
+        if (context.canceled)
+        {
+            // Saut variable : coupe le saut si on relâche tôt
+            if (rb.velocity.y > 0)
+            {
+                rb.velocity = new Vector2(rb.velocity.x, rb.velocity.y * jumpCutMultiplier);
             }
         }
     }
@@ -154,13 +256,11 @@ public class PlayerMovement2D : MonoBehaviour
         if (!context.performed)
             return;
 
-        // Si on est en l'air et qu'on a déjà utilisé l'air-dash → interdit
         if (!isGrounded && !isTouchingWall && !hasAirDash)
             return;
 
         if (canDash && !isDashing)
         {
-            // Si on dash en l'air → on consomme l'air-dash
             if (!isGrounded && !isTouchingWall)
                 hasAirDash = false;
 
@@ -173,31 +273,28 @@ public class PlayerMovement2D : MonoBehaviour
         canDash = false;
         isDashing = true;
 
-        // Momentum cancel
         rb.velocity = Vector2.zero;
 
         Vector2 dashDir;
-        // Si on est collé à un mur → dash automatiquement dans la direction opposée
+
+        // Dash automatique opposé au mur
         if (isTouchingWall && wallNormal != Vector2.zero)
         {
-            dashDir = new Vector2(Mathf.Sign(wallNormal.x), 0f);
+            dashDir = new Vector2(wallNormal.x, 0f);
         }
         else
         {
-            // Sinon dash normal (input ou direction du regard)
             dashDir = moveInput.sqrMagnitude > 0.01f
                 ? moveInput.normalized
                 : new Vector2(Mathf.Sign(transform.localScale.x), 0f);
         }
 
-
-        // Petit freeze frame pour le feeling
+        // Freeze frame
         float originalTimeScale = Time.timeScale;
         Time.timeScale = 0.05f;
         yield return new WaitForSecondsRealtime(0.05f);
         Time.timeScale = originalTimeScale;
 
-        // Trail visuel
         if (dashTrail != null)
             dashTrail.emitting = true;
 
@@ -208,7 +305,6 @@ public class PlayerMovement2D : MonoBehaviour
         if (dashTrail != null)
             dashTrail.emitting = false;
 
-        // Retour au contrôle normal
         rb.velocity = new Vector2(moveInput.x * moveSpeed, rb.velocity.y);
         isDashing = false;
 
@@ -220,10 +316,7 @@ public class PlayerMovement2D : MonoBehaviour
     {
         isWallJumping = true;
 
-        // La normale pointe déjà "loin du mur"
-        // mur à gauche → normal.x > 0 → on saute à droite (x > 0)
-        // mur à droite → normal.x < 0 → on saute à gauche (x < 0)
-        float jumpDirection = Mathf.Sign(wallNormal.x);
+        float jumpDirection = wallNormal.x; // normale = direction opposée au mur
 
         rb.velocity = new Vector2(jumpDirection * wallJumpForce, wallJumpForce);
 
@@ -240,58 +333,34 @@ public class PlayerMovement2D : MonoBehaviour
 
     private void MovePlayer()
     {
+        if (isLandingSmoothing)
+            return; // on bloque le mouvement pendant l’amorti
+
         if (isWallJumping)
             return;
 
-        float inputX = moveInput.x;
+        float targetSpeed = moveInput.x * moveSpeed;
+        float speedDiff = targetSpeed - rb.velocity.x;
 
-        // Empêche de pousser vers le mur juste après un wall jump
-        if (blockTowardsWall && isTouchingWall && wallNormal != Vector2.zero)
+        float accelRate;
+
+        if (isGrounded)
         {
-            // Si on pousse vers le mur (même signe que -normal), on bloque
-            if (Mathf.Sign(inputX) == -Mathf.Sign(wallNormal.x))
-                inputX = 0;
+            // Accélération ou décélération au sol
+            accelRate = (Mathf.Abs(targetSpeed) > 0.01f) ? acceleration : deceleration;
+        }
+        else
+        {
+            // Contrôle aérien réduit
+            float control = (Mathf.Abs(targetSpeed) > 0.01f) ? airAcceleration : airDeceleration;
+            accelRate = control * airControlMultiplier;
         }
 
-        rb.velocity = new Vector2(inputX * moveSpeed, rb.velocity.y);
+        float movement = accelRate * speedDiff * Time.deltaTime;
+
+        rb.velocity = new Vector2(rb.velocity.x + movement, rb.velocity.y);
     }
 
-    private void OnCollisionEnter2D(Collision2D collision)
-    {
-        Vector2 n = collision.contacts[0].normal;
-
-        if (useCollisionGround && collision.gameObject.CompareTag("Ground"))
-        {
-            isGrounded = true;
-        }
-
-        if (useCollisionWall && collision.gameObject.CompareTag("Wall"))
-        {
-            if (n.y > 0.9f)
-            {
-                isGrounded = true;
-                return;
-            }
-
-            if (Mathf.Abs(n.x) > 0.95f)
-            {
-                isTouchingWall = true;
-                wallNormal = n;
-            }
-        }
-    }
-
-    private void OnCollisionExit2D(Collision2D collision)
-    {
-        if (useCollisionGround && collision.gameObject.CompareTag("Ground"))
-            isGrounded = false;
-
-        if (useCollisionWall && collision.gameObject.CompareTag("Wall"))
-        {
-            isTouchingWall = false;
-            wallNormal = Vector2.zero;
-        }
-    }
 
     void OnDrawGizmosSelected()
     {
@@ -301,11 +370,18 @@ public class PlayerMovement2D : MonoBehaviour
             Gizmos.DrawWireSphere(groundCheck.position, groundCheckRadius);
         }
 
-        if (wallCheck != null)
+        if (wallCheckLeft != null)
         {
             Gizmos.color = Color.blue;
-            Vector3 dir = Vector3.right * Mathf.Sign(transform.localScale.x) * wallCheckDistance;
-            Gizmos.DrawLine(wallCheck.position, wallCheck.position + dir);
+            Gizmos.DrawLine(wallCheckLeft.position,
+                wallCheckLeft.position + Vector3.left * wallCheckDistance);
+        }
+
+        if (wallCheckRight != null)
+        {
+            Gizmos.color = Color.blue;
+            Gizmos.DrawLine(wallCheckRight.position,
+                wallCheckRight.position + Vector3.right * wallCheckDistance);
         }
     }
 }
